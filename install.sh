@@ -4,7 +4,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 APP_NAME="Kickoff"
-BUNDLE_ID="com.aqy.kickoff"
+BUNDLE_ID="dev.kickoff.launcher"
 APP="$HOME/Applications/$APP_NAME.app"
 PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.cleanup.plist"
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Remove Kickoff and its cleanup schedule. Task folders are left untouched.
-BUNDLE_ID="com.aqy.kickoff"
+BUNDLE_ID="dev.kickoff.launcher"
 PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.cleanup.plist"
 
 pkill -x Kickoff 2>/dev/null
