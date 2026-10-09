@@ -10,6 +10,21 @@ import ServiceManagement
 let tempPrefix = "tmp-"
 let baseDirKey = "BaseDirectory"
 let vscodeBundleID = "com.microsoft.VSCode"
+let recentKey = "RecentFolders"
+let recentLimit = 8
+
+/// Recently opened folders, newest first; entries that no longer exist are dropped.
+func recentFolders() -> [URL] {
+    let paths = UserDefaults.standard.stringArray(forKey: recentKey) ?? []
+    return paths.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        .filter { FileManager.default.fileExists(atPath: $0.path) }
+}
+
+func rememberRecent(_ folder: URL) {
+    var paths = (UserDefaults.standard.stringArray(forKey: recentKey) ?? []).filter { $0 != folder.path }
+    paths.insert(folder.path, at: 0)
+    UserDefaults.standard.set(Array(paths.prefix(recentLimit)), forKey: recentKey)
+}
 
 // MARK: - Folder logic (shared by app and cleanup mode)
 
@@ -250,6 +265,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var shortcutItem: NSMenuItem!
     private var loginItem: NSMenuItem!
     private var baseItem: NSMenuItem!
+    private var recentItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ note: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -257,6 +273,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let menu = NSMenu()
         newTaskItem = menu.addItem(withTitle: "New Task…", action: #selector(newTask), keyEquivalent: "")
+        recentItem = menu.addItem(withTitle: "Recent Folders", action: nil, keyEquivalent: "")
+        recentItem.submenu = NSMenu()
         menu.addItem(.separator())
         baseItem = menu.addItem(withTitle: "", action: #selector(revealBase), keyEquivalent: "")
         menu.addItem(withTitle: "Choose Agent Folder…", action: #selector(chooseBase), keyEquivalent: "")
@@ -298,6 +316,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func openInVSCode(_ folder: URL) {
+        rememberRecent(folder)
         guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: vscodeBundleID) else {
             NSWorkspace.shared.activateFileViewerSelecting([folder])
             return
@@ -316,6 +335,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard panel.runModal() == .OK, let url = panel.url else { return nil }
         UserDefaults.standard.set(url.path, forKey: baseDirKey)
         return url
+    }
+
+    @objc func openRecent(_ sender: NSMenuItem) {
+        if let url = sender.representedObject as? URL { openInVSCode(url) }
+    }
+
+    @objc func clearRecent() { UserDefaults.standard.removeObject(forKey: recentKey) }
+
+    private func refreshRecentMenu() {
+        let sub = recentItem.submenu!
+        sub.removeAllItems()
+        let recents = recentFolders()
+        recentItem.isEnabled = !recents.isEmpty
+        for url in recents {
+            let item = sub.addItem(withTitle: url.lastPathComponent, action: #selector(openRecent(_:)), keyEquivalent: "")
+            item.representedObject = url
+            item.toolTip = (url.path as NSString).abbreviatingWithTildeInPath
+        }
+        if !recents.isEmpty {
+            sub.addItem(.separator())
+            sub.addItem(withTitle: "Clear Menu", action: #selector(clearRecent), keyEquivalent: "")
+        }
     }
 
     @objc func chooseBase() { _ = promptForBase() }
@@ -434,6 +475,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
+        guard menu === statusItem.menu else { return }
+        refreshRecentMenu()
         baseItem.title = "Folder: " + (baseDirectory().map { ($0.path as NSString).abbreviatingWithTildeInPath } ?? "(not set)")
         baseItem.isEnabled = baseDirectory() != nil
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off

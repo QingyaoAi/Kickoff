@@ -19,7 +19,15 @@ A launchd job runs `Kickoff --cleanup` every day at 05:00. The job moves `tmp-*`
 - **Trash All Temp Folders Now** in the menu trashes every `tmp-*` folder immediately.
 - Log: `/tmp/Kickoff-cleanup.log`
 
+## Recent folders
+
+**Recent Folders** in the menu lists the last 8 folders you opened through Kickoff, newest first. Click one to open it in VS Code again. Folders that no longer exist (for example trashed temp folders) are hidden, and **Clear Menu** empties the list.
+
 ## Install
+
+**Prebuilt (no Xcode needed):** download `Kickoff.zip` from the [latest release](https://github.com/QingyaoAi/Kickoff/releases/latest), unzip it and move `Kickoff.app` to `~/Applications`. The app isn't notarized, so run `xattr -cr ~/Applications/Kickoff.app` once before opening it. The prebuilt app doesn't include the 05:00 cleanup job; use the build-from-source steps below for that.
+
+**From source:**
 
 Requirements: macOS 13 or later, [VS Code](https://code.visualstudio.com), and the Xcode Command Line Tools (run `xcode-select --install` if `swiftc` isn't found).
 
