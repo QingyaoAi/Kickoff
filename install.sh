@@ -21,6 +21,14 @@ for ARCH in arm64 x86_64; do   # universal binary: Apple Silicon + Intel
 done
 lipo -create "build/$APP_NAME-arm64" "build/$APP_NAME-x86_64" -output "$BUILD/Contents/MacOS/$APP_NAME"
 
+ICONSET="build/AppIcon.iconset"   # every size iconutil expects, scaled from the 1024px master
+mkdir -p "$ICONSET" "$BUILD/Contents/Resources"
+for SIZE in 16 32 128 256 512; do
+    sips -z "$SIZE" "$SIZE" Resources/AppIcon.png --out "$ICONSET/icon_${SIZE}x${SIZE}.png" >/dev/null
+    sips -z "$((SIZE * 2))" "$((SIZE * 2))" Resources/AppIcon.png --out "$ICONSET/icon_${SIZE}x${SIZE}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$BUILD/Contents/Resources/AppIcon.icns"
+
 cat > "$BUILD/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -29,6 +37,7 @@ cat > "$BUILD/Contents/Info.plist" <<EOF
     <key>CFBundleName</key><string>$APP_NAME</string>
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
     <key>CFBundleExecutable</key><string>$APP_NAME</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>1.2</string>
     <key>CFBundleVersion</key><string>3</string>
