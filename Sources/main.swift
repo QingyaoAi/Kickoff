@@ -1,6 +1,7 @@
-// Kickoff — menu bar app that creates a task folder and opens it in VS Code.
+// Kickoff — menu bar app that creates a task folder and opens it in VS Code or in dsh web.
 //
-//   Kickoff                       run as menu bar app (default hotkey ⌃⌥⌘T, changeable in the menu)
+//   Kickoff                       run as menu bar app (default hotkeys ⌃⌥⌘T for VS Code, ⌥D for dsh;
+//                                 changeable in the menu)
 //   Kickoff --cleanup             move stale temp folders to the Trash (run by launchd at 05:00)
 
 import Cocoa
@@ -10,8 +11,26 @@ import ServiceManagement
 let tempPrefix = "tmp-"
 let baseDirKey = "BaseDirectory"
 let vscodeBundleID = "com.microsoft.VSCode"
+let chromeBundleID = "com.google.Chrome"
 let recentKey = "RecentFolders"
 let recentLimit = 8
+
+/// Where a task folder opens. Each target has its own global shortcut.
+enum Opener: UInt32, CaseIterable {
+    case vscode = 1, dsh = 2 // also the Carbon hot key id
+
+    var name: String { self == .vscode ? "VS Code" : "dsh" }
+
+    var defaultShortcut: Shortcut {
+        switch self {
+        case .vscode: return Shortcut(keyCode: kVK_ANSI_T, modifiers: controlKey | optionKey | cmdKey)
+        case .dsh: return Shortcut(keyCode: kVK_ANSI_D, modifiers: optionKey)
+        }
+    }
+
+    /// UserDefaults key prefix; VS Code keeps the keys it had before dsh support.
+    var defaultsPrefix: String { self == .vscode ? "HotKey" : "DshHotKey" }
+}
 
 /// Recently opened folders, newest first; entries that no longer exist are dropped.
 func recentFolders() -> [URL] {
@@ -111,17 +130,16 @@ struct Shortcut: Equatable {
     var keyCode: Int
     var modifiers: Int
 
-    static let `default` = Shortcut(keyCode: kVK_ANSI_T, modifiers: controlKey | optionKey | cmdKey)
-
-    static var saved: Shortcut {
+    static func saved(for opener: Opener) -> Shortcut {
         let d = UserDefaults.standard
-        guard d.object(forKey: "HotKeyCode") != nil else { return .default }
-        return Shortcut(keyCode: d.integer(forKey: "HotKeyCode"), modifiers: d.integer(forKey: "HotKeyModifiers"))
+        let key = opener.defaultsPrefix
+        guard d.object(forKey: key + "Code") != nil else { return opener.defaultShortcut }
+        return Shortcut(keyCode: d.integer(forKey: key + "Code"), modifiers: d.integer(forKey: key + "Modifiers"))
     }
 
-    func save() {
-        UserDefaults.standard.set(keyCode, forKey: "HotKeyCode")
-        UserDefaults.standard.set(modifiers, forKey: "HotKeyModifiers")
+    func save(for opener: Opener) {
+        UserDefaults.standard.set(keyCode, forKey: opener.defaultsPrefix + "Code")
+        UserDefaults.standard.set(modifiers, forKey: opener.defaultsPrefix + "Modifiers")
     }
 
     init(keyCode: Int, modifiers: Int) {
@@ -227,23 +245,34 @@ struct Shortcut: Equatable {
 
 final class HotKey {
     private var ref: EventHotKeyRef?
-    private static var action: (() -> Void)?
+    private let id: UInt32
+    private static var actions: [UInt32: () -> Void] = [:]
 
-    init(action: @escaping () -> Void) {
-        HotKey.action = action
+    /// One handler serves every HotKey and dispatches on the hot key id.
+    private static let handler: Void = {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-            DispatchQueue.main.async { HotKey.action?() }
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+            var hotKeyID = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                              nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
+            let id = hotKeyID.id
+            DispatchQueue.main.async { HotKey.actions[id]?() }
             return noErr
         }, 1, &spec, nil, nil)
+    }()
+
+    init(id: UInt32, action: @escaping () -> Void) {
+        self.id = id
+        HotKey.actions[id] = action
+        _ = HotKey.handler
     }
 
     /// Registers exclusively, so it fails if another app holds the combination exclusively.
     /// (Apps registering non-exclusively can't be detected by any public API.)
     func register(_ shortcut: Shortcut) -> Bool {
         unregister()
-        let id = EventHotKeyID(signature: OSType(0x4B43_4B31), id: 1) // 'KCK1'
-        let status = RegisterEventHotKey(UInt32(shortcut.keyCode), UInt32(shortcut.modifiers), id,
+        let hotKeyID = EventHotKeyID(signature: OSType(0x4B43_4B31), id: id) // 'KCK1'
+        let status = RegisterEventHotKey(UInt32(shortcut.keyCode), UInt32(shortcut.modifiers), hotKeyID,
                                          GetApplicationEventTarget(), OptionBits(kEventHotKeyExclusive), &ref)
         if status != noErr { ref = nil }
         return status == noErr
@@ -255,30 +284,194 @@ final class HotKey {
     }
 }
 
+// MARK: - dsh web
+
+/// The user's login shell, so `dsh` and `node` resolve as they do in Terminal.
+func loginShell() -> String {
+    if let entry = getpwuid(getuid()), let shell = entry.pointee.pw_shell { return String(cString: shell) }
+    return "/bin/zsh"
+}
+
+/// True if something accepts TCP connections at the URL's host and port.
+func isListening(_ url: URL) -> Bool {
+    guard let host = url.host, let port = url.port else { return false }
+    var hints = addrinfo()
+    hints.ai_socktype = SOCK_STREAM
+    var list: UnsafeMutablePointer<addrinfo>?
+    guard getaddrinfo(host, String(port), &hints, &list) == 0, let first = list else { return false }
+    defer { freeaddrinfo(first) }
+    for info in sequence(first: first, next: { $0.pointee.ai_next }) {
+        let fd = socket(info.pointee.ai_family, info.pointee.ai_socktype, info.pointee.ai_protocol)
+        guard fd >= 0 else { continue }
+        defer { close(fd) }
+        if connect(fd, info.pointee.ai_addr, info.pointee.ai_addrlen) == 0 { return true }
+    }
+    return false
+}
+
+/// The app id of dsh web installed as a Chrome app (PWA), from the app shim Chrome keeps in
+/// ~/Applications/Chrome Apps.localized. A window launched through the app gets its own Dock icon;
+/// a plain `--app=` window is part of Chrome and doesn't. (Chrome's own data folder, which would
+/// say which profile has the app, is off limits to other apps, so Chrome picks its last-used profile.)
+func installedChromeAppID(for url: URL) -> String? {
+    let shims = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Chrome Apps.localized")
+    for shim in (try? FileManager.default.contentsOfDirectory(at: shims, includingPropertiesForKeys: nil)) ?? []
+    where shim.pathExtension == "app" {
+        guard let info = NSDictionary(contentsOf: shim.appendingPathComponent("Contents/Info.plist")),
+              info["CrBundleIdentifier"] as? String == chromeBundleID,
+              let id = info["CrAppModeShortcutID"] as? String,
+              let start = (info["CrAppModeShortcutURL"] as? String).flatMap(URL.init(string:)),
+              start.host == url.host, start.port == url.port else { continue }
+        return id
+    }
+    return nil
+}
+
+/// Opens task folders in the dsh (DeepSeek Harness) web UI, in a Chrome app window when Chrome is
+/// installed, and starts `dsh web` first if nothing is listening. The page URL carries the folder
+/// in its fragment; the dsh-kickoff plugin (dsh-plugin/) registers it as a workspace and opens it.
+final class DshLauncher {
+    static let webURL = URL(string: "http://127.0.0.1:3080/")!
+    static let logPath = "/tmp/Kickoff-dsh-web.log"
+    static let startTimeout: TimeInterval = 90
+    /// Written by the plugin while dsh web runs: the server's URL with its launch token.
+    static let signInURLFile = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".dsh/kickoff-web-url")
+
+    /// Unreserved ASCII and "/"; the plugin's URLSearchParams decodes everything else.
+    private static let fragmentSafe = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~/")
+
+    /// Folders waiting while the server is checked or started; empty when neither is in progress.
+    private var pending: [URL] = []
+
+    func open(_ folder: URL) {
+        pending.append(folder)
+        guard pending.count == 1 else { return }
+        DispatchQueue.global().async {
+            let up = isListening(DshLauncher.webURL)
+            DispatchQueue.main.async { up ? self.showPending(at: self.runningURL()) : self.startServer() }
+        }
+    }
+
+    /// The running server's sign-in URL when the plugin published one, so a browser without a
+    /// dsh cookie still gets in; otherwise the plain URL.
+    private func runningURL() -> URL {
+        guard let text = try? String(contentsOf: DshLauncher.signInURLFile, encoding: .utf8),
+              let url = URL(string: text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              url.host == DshLauncher.webURL.host, url.port == DshLauncher.webURL.port else { return DshLauncher.webURL }
+        return url
+    }
+
+    private func showPending(at base: URL) {
+        for folder in pending { show(folder, at: base) }
+        pending = []
+    }
+
+    private func show(_ folder: URL, at base: URL) {
+        var components = URLComponents(url: base, resolvingAgainstBaseURL: false)!
+        components.percentEncodedFragment = "kickoff-open="
+            + folder.path.addingPercentEncoding(withAllowedCharacters: DshLauncher.fragmentSafe)!
+        let page = components.url!
+        guard let chrome = NSWorkspace.shared.urlForApplication(withBundleIdentifier: chromeBundleID) else {
+            NSWorkspace.shared.open(page)
+            return
+        }
+        let config = NSWorkspace.OpenConfiguration()
+        config.createsNewApplicationInstance = true // like `open -n`, so a running Chrome gets the arguments
+        if let appID = installedChromeAppID(for: base) {
+            config.arguments = ["--app-id=" + appID, "--app-launch-url-for-shortcuts-menu-item=" + page.absoluteString]
+        } else {
+            config.arguments = ["--app=" + page.absoluteString]
+        }
+        NSWorkspace.shared.openApplication(at: chrome, configuration: config)
+    }
+
+    /// Runs `dsh web --no-open` through a login shell and waits for its "dsh web: <url>" line.
+    /// That URL carries a launch token that signs the browser in. Output goes to a file rather
+    /// than a pipe, so the server keeps running after Kickoff quits.
+    private func startServer() {
+        FileManager.default.createFile(atPath: DshLauncher.logPath, contents: nil)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: loginShell())
+        process.arguments = ["-l", "-c", "exec dsh web --no-open"]
+        process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle(forWritingAtPath: DshLauncher.logPath)
+        process.standardError = process.standardOutput
+        do {
+            try process.run()
+        } catch {
+            return fail(error.localizedDescription)
+        }
+
+        let deadline = Date().addingTimeInterval(DshLauncher.startTimeout)
+        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { timer in
+            if let url = self.announcedURL() {
+                timer.invalidate()
+                self.showPending(at: url)
+            } else if !process.isRunning {
+                timer.invalidate()
+                // Another dsh web (e.g. VS Code's) may have taken the port in the meantime.
+                if isListening(DshLauncher.webURL) { self.showPending(at: self.runningURL()) }
+                else { self.fail("dsh web quit while starting.") }
+            } else if Date() > deadline {
+                timer.invalidate()
+                self.fail("dsh web didn't start within \(Int(DshLauncher.startTimeout)) seconds.")
+            }
+        }
+    }
+
+    private func announcedURL() -> URL? {
+        guard let data = FileManager.default.contents(atPath: DshLauncher.logPath) else { return nil }
+        let prefix = "dsh web: http"
+        for line in String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline) where line.hasPrefix(prefix) {
+            return URL(string: line.dropFirst("dsh web: ".count).trimmingCharacters(in: .whitespaces))
+        }
+        return nil
+    }
+
+    private func fail(_ message: String) {
+        pending = []
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Couldn't open dsh"
+        alert.informativeText = "\(message)\n\nLog: \(DshLauncher.logPath)"
+        alert.runModal()
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
-    private var hotKey: HotKey!
-    private var hotKeyActive = false
-    private var newTaskItem: NSMenuItem!
-    private var shortcutItem: NSMenuItem!
+    private var hotKeys: [Opener: HotKey] = [:]
+    private var hotKeyActive: [Opener: Bool] = [:]
+    private var newTaskItems: [Opener: NSMenuItem] = [:]
+    private var shortcutItems: [Opener: NSMenuItem] = [:]
     private var loginItem: NSMenuItem!
     private var baseItem: NSMenuItem!
     private var recentItem: NSMenuItem!
+    private let dsh = DshLauncher()
 
     func applicationDidFinishLaunching(_ note: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "folder.badge.plus", accessibilityDescription: "Kickoff")
 
         let menu = NSMenu()
-        newTaskItem = menu.addItem(withTitle: "New Task…", action: #selector(newTask), keyEquivalent: "")
+        for opener in Opener.allCases {
+            let item = menu.addItem(withTitle: "New Task in \(opener.name)…", action: #selector(newTaskFromMenu(_:)), keyEquivalent: "")
+            item.tag = Int(opener.rawValue)
+            newTaskItems[opener] = item
+        }
         recentItem = menu.addItem(withTitle: "Recent Folders", action: nil, keyEquivalent: "")
         recentItem.submenu = NSMenu()
         menu.addItem(.separator())
         baseItem = menu.addItem(withTitle: "", action: #selector(revealBase), keyEquivalent: "")
         menu.addItem(withTitle: "Choose Agent Folder…", action: #selector(chooseBase), keyEquivalent: "")
-        shortcutItem = menu.addItem(withTitle: "", action: #selector(setShortcut), keyEquivalent: "")
+        for opener in Opener.allCases {
+            let item = menu.addItem(withTitle: "", action: #selector(setShortcutFromMenu(_:)), keyEquivalent: "")
+            item.tag = Int(opener.rawValue)
+            shortcutItems[opener] = item
+        }
         menu.addItem(withTitle: "Trash All Temp Folders Now", action: #selector(cleanupNow), keyEquivalent: "")
         loginItem = menu.addItem(withTitle: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: "")
         menu.addItem(.separator())
@@ -286,18 +479,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.delegate = self
         statusItem.menu = menu
 
-        hotKey = HotKey { [weak self] in self?.newTask() }
-        hotKeyActive = hotKey.register(.saved)
+        for opener in Opener.allCases {
+            hotKeys[opener] = HotKey(id: opener.rawValue) { [weak self] in self?.newTask(opener) }
+        }
+        resumeHotKeys()
     }
 
-    @objc func newTask() {
+    /// Registers every shortcut that isn't registered, from the saved settings.
+    private func resumeHotKeys() {
+        for opener in Opener.allCases where hotKeyActive[opener] != true {
+            hotKeyActive[opener] = hotKeys[opener]!.register(.saved(for: opener))
+        }
+    }
+
+    @objc func newTaskFromMenu(_ sender: NSMenuItem) { newTask(Opener(rawValue: UInt32(sender.tag))!) }
+
+    func newTask(_ opener: Opener) {
         guard let base = baseDirectory() ?? promptForBase() else { return }
 
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.icon = NSImage(systemSymbolName: "folder.badge.plus", accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: 48, weight: .regular))
-        alert.messageText = "Kickoff a New Task"
+        alert.messageText = "Kickoff a New Task in \(opener.name)"
         alert.informativeText = "Task name (leave empty for a temp folder, removed at 5:00 AM unless renamed):"
         alert.addButton(withTitle: "Create")
         alert.addButton(withTitle: "Cancel")
@@ -309,14 +513,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         do {
             let folder = try makeTaskFolder(in: base, taskName: field.stringValue)
-            openInVSCode(folder)
+            open(folder, in: opener)
         } catch {
             NSAlert(error: error).runModal()
         }
     }
 
-    private func openInVSCode(_ folder: URL) {
+    private func open(_ folder: URL, in opener: Opener) {
         rememberRecent(folder)
+        switch opener {
+        case .vscode: openInVSCode(folder)
+        case .dsh: dsh.open(folder)
+        }
+    }
+
+    private func openInVSCode(_ folder: URL) {
         guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: vscodeBundleID) else {
             NSWorkspace.shared.activateFileViewerSelecting([folder])
             return
@@ -338,7 +549,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openRecent(_ sender: NSMenuItem) {
-        if let url = sender.representedObject as? URL { openInVSCode(url) }
+        if let url = sender.representedObject as? URL { open(url, in: Opener(rawValue: UInt32(sender.tag))!) }
     }
 
     @objc func clearRecent() { UserDefaults.standard.removeObject(forKey: recentKey) }
@@ -349,9 +560,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let recents = recentFolders()
         recentItem.isEnabled = !recents.isEmpty
         for url in recents {
-            let item = sub.addItem(withTitle: url.lastPathComponent, action: #selector(openRecent(_:)), keyEquivalent: "")
-            item.representedObject = url
-            item.toolTip = (url.path as NSString).abbreviatingWithTildeInPath
+            // Click opens in VS Code; holding ⌥ swaps in the dsh item.
+            for opener in Opener.allCases {
+                let item = sub.addItem(withTitle: url.lastPathComponent, action: #selector(openRecent(_:)), keyEquivalent: "")
+                item.representedObject = url
+                item.tag = Int(opener.rawValue)
+                item.toolTip = (url.path as NSString).abbreviatingWithTildeInPath
+                item.keyEquivalentModifierMask = []
+                if opener == .dsh {
+                    item.title += " — dsh"
+                    item.keyEquivalentModifierMask = .option
+                    item.isAlternate = true
+                }
+            }
         }
         if !recents.isEmpty {
             sub.addItem(.separator())
@@ -365,16 +586,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let base = baseDirectory() { NSWorkspace.shared.open(base) }
     }
 
-    @objc func setShortcut() {
-        let current = Shortcut.saved
-        hotKey.unregister() // so pressing the current combination records it instead of firing
-        hotKeyActive = false
+    @objc func setShortcutFromMenu(_ sender: NSMenuItem) { setShortcut(Opener(rawValue: UInt32(sender.tag))!) }
+
+    func setShortcut(_ opener: Opener) {
+        let current = Shortcut.saved(for: opener)
+        // Pause every shortcut, so pressing one records it instead of firing it.
+        hotKeys.values.forEach { $0.unregister() }
+        hotKeyActive.removeAll()
+        defer { resumeHotKeys() }
 
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.icon = NSImage(systemSymbolName: "keyboard", accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: 48, weight: .regular))
-        alert.messageText = "Set Shortcut"
+        alert.messageText = "Set Shortcut for New Task in \(opener.name)"
         alert.informativeText = """
             Press the new key combination: ⌘, ⌥ or ⌃ with any key, ⇧ with Space, Tab or an arrow, or an F-key alone.
 
@@ -383,7 +608,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             """
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Reset to \(Shortcut.default.display)")
+        alert.addButton(withTitle: "Reset to \(opener.defaultShortcut.display)")
         let label = NSTextField(labelWithString: current.display)
         label.font = .systemFont(ofSize: 24, weight: .medium)
         label.alignment = .center
@@ -421,23 +646,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let monitor { NSEvent.removeMonitor(monitor) }
 
         switch response {
-        case .alertFirstButtonReturn: apply(candidate, previous: current)
-        case .alertThirdButtonReturn: apply(.default, previous: current)
-        default: hotKeyActive = hotKey.register(current)
+        case .alertFirstButtonReturn: apply(candidate, previous: current, for: opener)
+        case .alertThirdButtonReturn: apply(opener.defaultShortcut, previous: current, for: opener)
+        default: break
         }
     }
 
     /// Validates and registers `shortcut`; on a problem, explains it and reopens the recorder.
-    private func apply(_ shortcut: Shortcut, previous: Shortcut) {
+    private func apply(_ shortcut: Shortcut, previous: Shortcut, for opener: Opener) {
         func reject(_ message: String) {
             let alert = NSAlert()
             alert.messageText = "\(shortcut.display) can't be used"
             alert.informativeText = message
             alert.runModal()
-            hotKeyActive = hotKey.register(previous)
-            setShortcut()
+            setShortcut(opener)
         }
 
+        if let other = Opener.allCases.first(where: { $0 != opener && Shortcut.saved(for: $0) == shortcut }) {
+            return reject("It is already the shortcut for New Task in \(other.name).")
+        }
         if shortcut != previous {
             if shortcut.isSystemShortcut {
                 return reject("It is already a macOS shortcut. Pick another one, or turn that one off in System Settings › Keyboard › Keyboard Shortcuts.")
@@ -449,16 +676,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 alert.addButton(withTitle: "Use Anyway")
                 alert.addButton(withTitle: "Choose Another")
                 if alert.runModal() != .alertFirstButtonReturn {
-                    hotKeyActive = hotKey.register(previous)
-                    return setShortcut()
+                    return setShortcut(opener)
                 }
             }
         }
-        guard hotKey.register(shortcut) else {
+        guard hotKeys[opener]!.register(shortcut) else {
             return reject("Another app has reserved it. Pick another one.")
         }
-        hotKeyActive = true
-        shortcut.save()
+        hotKeyActive[opener] = true
+        shortcut.save(for: opener)
     }
 
     @objc func cleanupNow() { cleanupTempFolders(all: true) }
@@ -481,10 +707,14 @@ extension AppDelegate: NSMenuDelegate {
         baseItem.isEnabled = baseDirectory() != nil
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
 
-        let shortcut = Shortcut.saved
-        newTaskItem.keyEquivalent = hotKeyActive ? shortcut.menuEquivalent : ""
-        newTaskItem.keyEquivalentModifierMask = shortcut.cocoaModifiers
-        shortcutItem.title = hotKeyActive ? "Set Shortcut…" : "Set Shortcut… (\(shortcut.display) is taken by another app)"
+        for opener in Opener.allCases {
+            let shortcut = Shortcut.saved(for: opener)
+            let active = hotKeyActive[opener] == true
+            newTaskItems[opener]!.keyEquivalent = active ? shortcut.menuEquivalent : ""
+            newTaskItems[opener]!.keyEquivalentModifierMask = shortcut.cocoaModifiers
+            shortcutItems[opener]!.title = "Set \(opener.name) Shortcut…"
+                + (active ? "" : " (\(shortcut.display) is taken by another app)")
+        }
     }
 }
 

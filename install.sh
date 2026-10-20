@@ -1,5 +1,6 @@
 #!/bin/bash
-# Build Kickoff.app, install it to ~/Applications, and schedule the 05:00 cleanup.
+# Build Kickoff.app, install it to ~/Applications, schedule the 05:00 cleanup,
+# and add the dsh-kickoff plugin to the dsh web profile.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -7,6 +8,7 @@ APP_NAME="Kickoff"
 BUNDLE_ID="dev.kickoff.launcher"
 APP="$HOME/Applications/$APP_NAME.app"
 PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.cleanup.plist"
+DSH_PROFILE="${DSH_HOME:-$HOME/.dsh}/profiles/web"
 
 echo "==> Building"
 BUILD="build/$APP_NAME.app"
@@ -28,8 +30,8 @@ cat > "$BUILD/Contents/Info.plist" <<EOF
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
     <key>CFBundleExecutable</key><string>$APP_NAME</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.1</string>
-    <key>CFBundleVersion</key><string>2</string>
+    <key>CFBundleShortVersionString</key><string>1.2</string>
+    <key>CFBundleVersion</key><string>3</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
 </dict>
@@ -69,6 +71,24 @@ EOF
 launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 
+if [ -f "$DSH_PROFILE/package.json" ] && command -v node >/dev/null; then
+    echo "==> Installing the dsh-kickoff plugin into $DSH_PROFILE"
+    rm -rf "$DSH_PROFILE/node_modules/dsh-kickoff"
+    mkdir -p "$DSH_PROFILE/node_modules"
+    cp -R dsh-plugin "$DSH_PROFILE/node_modules/dsh-kickoff"
+    node -e '
+        const fs = require("fs"), file = process.argv[1]
+        const pkg = JSON.parse(fs.readFileSync(file, "utf8"))
+        const bundles = ((pkg.dsh ??= {}).profile ??= {}).bundles ??= []
+        if (!bundles.includes("dsh-kickoff")) {
+            bundles.push("dsh-kickoff")
+            fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n")
+        }' "$DSH_PROFILE/package.json"
+    echo "    Restart dsh web (or VS Code, if its dsh extension started it) to load the plugin."
+else
+    echo "==> No dsh web profile at $DSH_PROFILE; skipping the dsh-kickoff plugin (New Task in dsh needs it)"
+fi
+
 echo "==> Launching"
 open "$APP"
-echo "Done. Press your shortcut (default ⌃⌥⌘T) or click the folder icon in the menu bar."
+echo "Done. Press your shortcut (default ⌃⌥⌘T for VS Code, ⌥D for dsh) or click the folder icon in the menu bar."
