@@ -1,7 +1,6 @@
-// Kickoff — menu bar app that creates a task folder and opens it in VS Code or in dsh web.
+// Kickoff — menu bar app that creates a task folder and opens it in an agent app.
 //
-//   Kickoff                       run as menu bar app (default hotkeys ⌃⌥⌘T for VS Code, ⌥D for dsh;
-//                                 changeable in the menu)
+//   Kickoff                       run as menu bar app (shortcuts configurable in the menu)
 //   Kickoff --cleanup             move stale temp folders to the Trash (run by launchd at 05:00)
 
 import Cocoa
@@ -11,25 +10,38 @@ import ServiceManagement
 let tempPrefix = "tmp-"
 let baseDirKey = "BaseDirectory"
 let vscodeBundleID = "com.microsoft.VSCode"
-let chromeBundleID = "com.google.Chrome"
+let deepseekBundleID = "com.deepseek.dsh"
+let codexBundleID = "com.openai.codex"
 let recentKey = "RecentFolders"
 let recentLimit = 8
 
 /// Where a task folder opens. Each target has its own global shortcut.
 enum Opener: UInt32, CaseIterable {
-    case vscode = 1, dsh = 2 // also the Carbon hot key id
+    case vscode = 1, deepseek = 3, codex = 4 // also the Carbon hot key id
 
-    var name: String { self == .vscode ? "VS Code" : "dsh" }
+    var name: String {
+        switch self {
+        case .vscode: return "VS Code"
+        case .deepseek: return "DeepSeek Harness"
+        case .codex: return "Codex"
+        }
+    }
 
     var defaultShortcut: Shortcut {
         switch self {
         case .vscode: return Shortcut(keyCode: kVK_ANSI_T, modifiers: controlKey | optionKey | cmdKey)
-        case .dsh: return Shortcut(keyCode: kVK_ANSI_D, modifiers: optionKey)
+        case .deepseek: return Shortcut(keyCode: kVK_ANSI_D, modifiers: optionKey)
+        case .codex: return Shortcut(keyCode: kVK_ANSI_C, modifiers: optionKey)
         }
     }
 
-    /// UserDefaults key prefix; VS Code keeps the keys it had before dsh support.
-    var defaultsPrefix: String { self == .vscode ? "HotKey" : "DshHotKey" }
+    var defaultsPrefix: String {
+        switch self {
+        case .vscode: return "HotKey"
+        case .deepseek: return "DeepSeekHotKey"
+        case .codex: return "CodexHotKey"
+        }
+    }
 }
 
 /// Recently opened folders, newest first; entries that no longer exist are dropped.
@@ -284,158 +296,78 @@ final class HotKey {
     }
 }
 
-// MARK: - dsh web
+// MARK: - Desktop apps
 
-/// The user's login shell, so `dsh` and `node` resolve as they do in Terminal.
+/// The user's login shell, so the fallback `codex` command resolves as it does in Terminal.
 func loginShell() -> String {
     if let entry = getpwuid(getuid()), let shell = entry.pointee.pw_shell { return String(cString: shell) }
     return "/bin/zsh"
 }
 
-/// True if something accepts TCP connections at the URL's host and port.
-func isListening(_ url: URL) -> Bool {
-    guard let host = url.host, let port = url.port else { return false }
-    var hints = addrinfo()
-    hints.ai_socktype = SOCK_STREAM
-    var list: UnsafeMutablePointer<addrinfo>?
-    guard getaddrinfo(host, String(port), &hints, &list) == 0, let first = list else { return false }
-    defer { freeaddrinfo(first) }
-    for info in sequence(first: first, next: { $0.pointee.ai_next }) {
-        let fd = socket(info.pointee.ai_family, info.pointee.ai_socktype, info.pointee.ai_protocol)
-        guard fd >= 0 else { continue }
-        defer { close(fd) }
-        if connect(fd, info.pointee.ai_addr, info.pointee.ai_addrlen) == 0 { return true }
-    }
-    return false
+func showOpenError(_ opener: Opener, _ message: String) {
+    NSApp.activate(ignoringOtherApps: true)
+    let alert = NSAlert()
+    alert.messageText = "Couldn't open \(opener.name)"
+    alert.informativeText = message
+    alert.runModal()
 }
 
-/// The app id of dsh web installed as a Chrome app (PWA), from the app shim Chrome keeps in
-/// ~/Applications/Chrome Apps.localized. A window launched through the app gets its own Dock icon;
-/// a plain `--app=` window is part of Chrome and doesn't. (Chrome's own data folder, which would
-/// say which profile has the app, is off limits to other apps, so Chrome picks its last-used profile.)
-func installedChromeAppID(for url: URL) -> String? {
-    let shims = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Chrome Apps.localized")
-    for shim in (try? FileManager.default.contentsOfDirectory(at: shims, includingPropertiesForKeys: nil)) ?? []
-    where shim.pathExtension == "app" {
-        guard let info = NSDictionary(contentsOf: shim.appendingPathComponent("Contents/Info.plist")),
-              info["CrBundleIdentifier"] as? String == chromeBundleID,
-              let id = info["CrAppModeShortcutID"] as? String,
-              let start = (info["CrAppModeShortcutURL"] as? String).flatMap(URL.init(string:)),
-              start.host == url.host, start.port == url.port else { continue }
-        return id
+/// The Desktop plugin reads and acknowledges these requests through its authenticated host.
+func openInDeepSeek(_ folder: URL) {
+    guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: deepseekBundleID) else {
+        return showOpenError(.deepseek, "Install DeepSeek Harness Desktop and try again.")
     }
-    return nil
+    let fm = FileManager.default
+    let requests = fm.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/dev.kickoff.launcher/DeepSeek", isDirectory: true)
+    let timestamp = Int64(Date().timeIntervalSince1970 * 1_000)
+    let request = requests.appendingPathComponent("\(timestamp)-\(UUID().uuidString).request")
+    do {
+        try fm.createDirectory(at: requests, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try Data(folder.path.utf8).write(to: request, options: .atomic)
+    } catch {
+        return showOpenError(.deepseek, error.localizedDescription)
+    }
+
+    NSWorkspace.shared.open([URL(string: "dsh://open")!], withApplicationAt: app,
+                            configuration: NSWorkspace.OpenConfiguration()) { _, error in
+        guard let error else { return }
+        DispatchQueue.main.async {
+            guard (try? fm.removeItem(at: request)) != nil else { return }
+            showOpenError(.deepseek, error.localizedDescription)
+        }
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 60) {
+        guard (try? fm.removeItem(at: request)) != nil else { return }
+        showOpenError(.deepseek, "DeepSeek Harness didn't open the folder. Check that the dsh-kickoff plugin is installed and enabled, then reopen the app and try again.")
+    }
 }
 
-/// Opens task folders in the dsh (DeepSeek Harness) web UI, in a Chrome app window when Chrome is
-/// installed, and starts `dsh web` first if nothing is listening. The page URL carries the folder
-/// in its fragment; the dsh-kickoff plugin (dsh-plugin/) registers it as a workspace and opens it.
-final class DshLauncher {
-    static let webURL = URL(string: "http://127.0.0.1:3080/")!
-    static let logPath = "/tmp/Kickoff-dsh-web.log"
-    static let startTimeout: TimeInterval = 90
-    /// Written by the plugin while dsh web runs: the server's URL with its launch token.
-    static let signInURLFile = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".dsh/kickoff-web-url")
-
-    /// Unreserved ASCII and "/"; the plugin's URLSearchParams decodes everything else.
-    private static let fragmentSafe = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~/")
-
-    /// Folders waiting while the server is checked or started; empty when neither is in progress.
-    private var pending: [URL] = []
-
-    func open(_ folder: URL) {
-        pending.append(folder)
-        guard pending.count == 1 else { return }
-        DispatchQueue.global().async {
-            let up = isListening(DshLauncher.webURL)
-            DispatchQueue.main.async { up ? self.showPending(at: self.runningURL()) : self.startServer() }
-        }
+func openInCodex(_ folder: URL) {
+    guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: codexBundleID) else {
+        return showOpenError(.codex, "Install the Codex desktop app and try again.")
     }
-
-    /// The running server's sign-in URL when the plugin published one, so a browser without a
-    /// dsh cookie still gets in; otherwise the plain URL.
-    private func runningURL() -> URL {
-        guard let text = try? String(contentsOf: DshLauncher.signInURLFile, encoding: .utf8),
-              let url = URL(string: text.trimmingCharacters(in: .whitespacesAndNewlines)),
-              url.host == DshLauncher.webURL.host, url.port == DshLauncher.webURL.port else { return DshLauncher.webURL }
-        return url
-    }
-
-    private func showPending(at base: URL) {
-        for folder in pending { show(folder, at: base) }
-        pending = []
-    }
-
-    private func show(_ folder: URL, at base: URL) {
-        var components = URLComponents(url: base, resolvingAgainstBaseURL: false)!
-        components.percentEncodedFragment = "kickoff-open="
-            + folder.path.addingPercentEncoding(withAllowedCharacters: DshLauncher.fragmentSafe)!
-        let page = components.url!
-        guard let chrome = NSWorkspace.shared.urlForApplication(withBundleIdentifier: chromeBundleID) else {
-            NSWorkspace.shared.open(page)
-            return
-        }
-        let config = NSWorkspace.OpenConfiguration()
-        config.createsNewApplicationInstance = true // like `open -n`, so a running Chrome gets the arguments
-        if let appID = installedChromeAppID(for: base) {
-            config.arguments = ["--app-id=" + appID, "--app-launch-url-for-shortcuts-menu-item=" + page.absoluteString]
-        } else {
-            config.arguments = ["--app=" + page.absoluteString]
-        }
-        NSWorkspace.shared.openApplication(at: chrome, configuration: config)
-    }
-
-    /// Runs `dsh web --no-open` through a login shell and waits for its "dsh web: <url>" line.
-    /// That URL carries a launch token that signs the browser in. Output goes to a file rather
-    /// than a pipe, so the server keeps running after Kickoff quits.
-    private func startServer() {
-        FileManager.default.createFile(atPath: DshLauncher.logPath, contents: nil)
-        let process = Process()
+    let cli = app.appendingPathComponent("Contents/Resources/codex-cli/bin/codex")
+    let process = Process()
+    if FileManager.default.isExecutableFile(atPath: cli.path) {
+        process.executableURL = cli
+        process.arguments = ["app", "--", folder.path]
+    } else {
         process.executableURL = URL(fileURLWithPath: loginShell())
-        process.arguments = ["-l", "-c", "exec dsh web --no-open"]
-        process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle(forWritingAtPath: DshLauncher.logPath)
-        process.standardError = process.standardOutput
-        do {
-            try process.run()
-        } catch {
-            return fail(error.localizedDescription)
-        }
-
-        let deadline = Date().addingTimeInterval(DshLauncher.startTimeout)
-        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { timer in
-            if let url = self.announcedURL() {
-                timer.invalidate()
-                self.showPending(at: url)
-            } else if !process.isRunning {
-                timer.invalidate()
-                // Another dsh web (e.g. VS Code's) may have taken the port in the meantime.
-                if isListening(DshLauncher.webURL) { self.showPending(at: self.runningURL()) }
-                else { self.fail("dsh web quit while starting.") }
-            } else if Date() > deadline {
-                timer.invalidate()
-                self.fail("dsh web didn't start within \(Int(DshLauncher.startTimeout)) seconds.")
-            }
+        process.arguments = ["-l", "-c", "exec codex app -- \"$1\"", "kickoff", folder.path]
+    }
+    process.currentDirectoryURL = folder
+    process.standardInput = FileHandle.nullDevice
+    process.terminationHandler = { process in
+        guard process.terminationStatus != 0 else { return }
+        DispatchQueue.main.async {
+            showOpenError(.codex, "The codex app command exited with status \(process.terminationStatus). Check that the Codex CLI is installed and up to date.")
         }
     }
-
-    private func announcedURL() -> URL? {
-        guard let data = FileManager.default.contents(atPath: DshLauncher.logPath) else { return nil }
-        let prefix = "dsh web: http"
-        for line in String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline) where line.hasPrefix(prefix) {
-            return URL(string: line.dropFirst("dsh web: ".count).trimmingCharacters(in: .whitespaces))
-        }
-        return nil
-    }
-
-    private func fail(_ message: String) {
-        pending = []
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText = "Couldn't open dsh"
-        alert.informativeText = "\(message)\n\nLog: \(DshLauncher.logPath)"
-        alert.runModal()
+    do {
+        try process.run()
+    } catch {
+        showOpenError(.codex, error.localizedDescription)
     }
 }
 
@@ -450,7 +382,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var loginItem: NSMenuItem!
     private var baseItem: NSMenuItem!
     private var recentItem: NSMenuItem!
-    private let dsh = DshLauncher()
 
     func applicationDidFinishLaunching(_ note: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -523,7 +454,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rememberRecent(folder)
         switch opener {
         case .vscode: openInVSCode(folder)
-        case .dsh: dsh.open(folder)
+        case .deepseek: openInDeepSeek(folder)
+        case .codex: openInCodex(folder)
         }
     }
 
@@ -549,7 +481,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openRecent(_ sender: NSMenuItem) {
-        if let url = sender.representedObject as? URL { open(url, in: Opener(rawValue: UInt32(sender.tag))!) }
+        if let url = sender.representedObject as? URL { open(url, in: .vscode) }
     }
 
     @objc func clearRecent() { UserDefaults.standard.removeObject(forKey: recentKey) }
@@ -560,19 +492,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let recents = recentFolders()
         recentItem.isEnabled = !recents.isEmpty
         for url in recents {
-            // Click opens in VS Code; holding ⌥ swaps in the dsh item.
-            for opener in Opener.allCases {
-                let item = sub.addItem(withTitle: url.lastPathComponent, action: #selector(openRecent(_:)), keyEquivalent: "")
-                item.representedObject = url
-                item.tag = Int(opener.rawValue)
-                item.toolTip = (url.path as NSString).abbreviatingWithTildeInPath
-                item.keyEquivalentModifierMask = []
-                if opener == .dsh {
-                    item.title += " — dsh"
-                    item.keyEquivalentModifierMask = .option
-                    item.isAlternate = true
-                }
-            }
+            let item = sub.addItem(withTitle: url.lastPathComponent, action: #selector(openRecent(_:)), keyEquivalent: "")
+            item.representedObject = url
+            item.toolTip = (url.path as NSString).abbreviatingWithTildeInPath
         }
         if !recents.isEmpty {
             sub.addItem(.separator())

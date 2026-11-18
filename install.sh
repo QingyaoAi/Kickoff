@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build Kickoff.app, install it to ~/Applications, schedule the 05:00 cleanup,
-# and add the dsh-kickoff plugin to the dsh web profile.
+# and install the dsh-kickoff plugin for DeepSeek Harness Desktop.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -8,7 +8,12 @@ APP_NAME="Kickoff"
 BUNDLE_ID="dev.kickoff.launcher"
 APP="$HOME/Applications/$APP_NAME.app"
 PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.cleanup.plist"
-DSH_PROFILE="${DSH_HOME:-$HOME/.dsh}/profiles/web"
+DSH_ROOT="${DSH_HOME:-$HOME/.dsh}"
+DSH_DESKTOP_PROFILE="$DSH_ROOT/profiles/desktop"
+DSH_DESKTOP_CLI="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
+if [ ! -x "$DSH_DESKTOP_CLI" ]; then
+    DSH_DESKTOP_CLI="$HOME/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
+fi
 
 echo "==> Building"
 BUILD="build/$APP_NAME.app"
@@ -28,6 +33,7 @@ for SIZE in 16 32 128 256 512; do
     sips -z "$((SIZE * 2))" "$((SIZE * 2))" Resources/AppIcon.png --out "$ICONSET/icon_${SIZE}x${SIZE}@2x.png" >/dev/null
 done
 iconutil -c icns "$ICONSET" -o "$BUILD/Contents/Resources/AppIcon.icns"
+cp -R dsh-plugin "$BUILD/Contents/Resources/dsh-kickoff"
 
 cat > "$BUILD/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -39,8 +45,8 @@ cat > "$BUILD/Contents/Info.plist" <<EOF
     <key>CFBundleExecutable</key><string>$APP_NAME</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.2</string>
-    <key>CFBundleVersion</key><string>3</string>
+    <key>CFBundleShortVersionString</key><string>1.4</string>
+    <key>CFBundleVersion</key><string>5</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
 </dict>
@@ -80,24 +86,41 @@ EOF
 launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 
-if [ -f "$DSH_PROFILE/package.json" ] && command -v node >/dev/null; then
-    echo "==> Installing the dsh-kickoff plugin into $DSH_PROFILE"
-    rm -rf "$DSH_PROFILE/node_modules/dsh-kickoff"
-    mkdir -p "$DSH_PROFILE/node_modules"
-    cp -R dsh-plugin "$DSH_PROFILE/node_modules/dsh-kickoff"
-    node -e '
-        const fs = require("fs"), file = process.argv[1]
-        const pkg = JSON.parse(fs.readFileSync(file, "utf8"))
-        const bundles = ((pkg.dsh ??= {}).profile ??= {}).bundles ??= []
-        if (!bundles.includes("dsh-kickoff")) {
-            bundles.push("dsh-kickoff")
-            fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n")
-        }' "$DSH_PROFILE/package.json"
-    echo "    Restart dsh web (or VS Code, if its dsh extension started it) to load the plugin."
+# Retire the plugin copied into the Web profile by earlier Kickoff installers.
+LEGACY_WEB_PROFILE="$DSH_ROOT/profiles/web"
+if [ -f "$LEGACY_WEB_PROFILE/package.json" ] && command -v node >/dev/null; then
+    node - "$LEGACY_WEB_PROFILE" <<'JS'
+const fs = require('node:fs')
+const { join } = require('node:path')
+const profile = process.argv[2]
+const file = join(profile, 'package.json')
+const pkg = JSON.parse(fs.readFileSync(file, 'utf8'))
+const bundles = pkg.dsh?.profile?.bundles
+if (Array.isArray(bundles) && bundles.includes('dsh-kickoff')) {
+    pkg.dsh.profile.bundles = bundles.filter(name => name !== 'dsh-kickoff')
+    const temporary = file + '.kickoff-' + process.pid
+    fs.writeFileSync(temporary, JSON.stringify(pkg, null, 2) + '\n', { mode: fs.statSync(file).mode & 0o777 })
+    fs.renameSync(temporary, file)
+    console.log('==> Disabled the legacy Kickoff plugin in the Web profile')
+}
+if (!pkg.dependencies?.['dsh-kickoff']) {
+    fs.rmSync(join(profile, 'node_modules/dsh-kickoff'), { recursive: true, force: true })
+}
+JS
+fi
+rm -f "$DSH_ROOT/kickoff-web-url"
+
+if [ -x "$DSH_DESKTOP_CLI" ] && [ -f "$DSH_DESKTOP_PROFILE/package.json" ]; then
+    echo "==> Installing the dsh-kickoff plugin for DeepSeek Harness Desktop"
+    if "$DSH_DESKTOP_CLI" plugin --profile desktop add --offline --ignore-scripts "link:$APP/Contents/Resources/dsh-kickoff"; then
+        echo "    Reopen DeepSeek Harness to load the plugin."
+    else
+        echo "    Desktop plugin setup failed. Quit DeepSeek Harness and rerun ./install.sh." >&2
+    fi
 else
-    echo "==> No dsh web profile at $DSH_PROFILE; skipping the dsh-kickoff plugin (New Task in dsh needs it)"
+    echo "==> Open and quit DeepSeek Harness Desktop once, then rerun ./install.sh to enable its shortcut."
 fi
 
 echo "==> Launching"
 open "$APP"
-echo "Done. Press your shortcut (default ⌃⌥⌘T for VS Code, ⌥D for dsh) or click the folder icon in the menu bar."
+echo "Done. Default shortcuts are ⌃⌥⌘T for VS Code, ⌥D for DeepSeek Harness, and ⌥C for Codex."

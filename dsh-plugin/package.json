@@ -1,7 +1,7 @@
 {
   "name": "dsh-kickoff",
-  "version": "1.0.0",
-  "description": "DeepSeek Harness plugin for Kickoff: opens the folder named in the page URL as a dsh workspace, and unregisters Kickoff temp folders once they are trashed.",
+  "version": "1.2.0",
+  "description": "DeepSeek Harness Desktop plugin for Kickoff that opens task folders as workspaces and unregisters temp folders after cleanup.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

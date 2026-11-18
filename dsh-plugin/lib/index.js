@@ -1,49 +1,55 @@
-// dsh-kickoff host half.
-//
-// 1. Sign-in URL for Kickoff. Kickoff opens dsh web in a browser that may have no dsh
-//    sign-in cookie, for a server it didn't start (e.g. one started by the VS Code
-//    extension), so it can't see the launch token that server printed. This writes the
-//    token URL to <dsh home>/kickoff-web-url (mode 600, inside the 700 dsh home) while
-//    the server runs, and removes it on shutdown.
-//
-// 2. Dead temp folders. Kickoff names unnamed task folders tmp-YYYYMMDD-HHmmss and its
-//    05:00 job moves them to the Trash. Each one opened in dsh left a workspace whose
-//    directory no longer exists, so the sidebar would fill up with dead tmp-* entries.
-//    At startup and then every hour, such a workspace has its sessions archived (still
-//    listed under "show archived") and its registration removed. Folders that still
-//    exist, and every folder not named like a Kickoff temp folder, are left alone.
+// Desktop receives workspace requests over the authenticated Host route. It also
+// archives sessions and removes registrations for trashed Kickoff temp folders.
 
-import { chmodSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { readFile, readdir, rm, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, isAbsolute, join } from 'node:path'
 
 export const name = 'dsh-kickoff'
 
 export const inject = ['workspaceRegistry']
 
-const URL_FILE = join(process.env.DSH_HOME?.trim() || join(homedir(), '.dsh'), 'kickoff-web-url')
 const TEMP_FOLDER = /^tmp-\d{8}-\d{6}$/
 const SWEEP_INTERVAL_MS = 60 * 60 * 1000
+const DESKTOP_REQUESTS = join(homedir(), 'Library/Application Support/dev.kickoff.launcher/DeepSeek')
+const REQUEST_FILE = /^\d+-[a-f0-9-]{36}\.request$/i
+const REQUEST_LIFETIME_MS = 60 * 1000
 
-function publishSignInUrl(ctx) {
-  ctx.inject(['connection', 'webApp'], (webCtx) => {
-    let written
-    let disposed = false
-    // The origin is readable once the listener is bound; the Loader settling guarantees that.
-    void Promise.resolve(webCtx.get('loader')?.await()).then(() => {
-      if (disposed) return
-      written = webCtx.connection.authenticatedUrl(webCtx.webApp.getAdvertisedUrl()) + '\n'
-      writeFileSync(URL_FILE, written, { mode: 0o600 })
-      chmodSync(URL_FILE, 0o600)
-    }).catch((error) => {
-      console.warn(`[dsh-kickoff] could not write ${URL_FILE}: ${error instanceof Error ? error.message : error}`)
-    })
-    webCtx.effect(() => () => {
-      disposed = true
-      try {
-        // Another dsh web may have replaced it since.
-        if (written !== undefined && readFileSync(URL_FILE, 'utf8') === written) rmSync(URL_FILE)
-      } catch {}
+function serveDesktopRequests(ctx) {
+  ctx.inject(['connection'], (desktopCtx) => {
+    desktopCtx.connection.fetch.register({
+      path: '/api/kickoff/workspace',
+      methods: ['GET', 'POST'],
+      requestBody: 'buffered',
+      async fetch(request) {
+        if (request.method === 'POST') {
+          const id = new URL(request.url).searchParams.get('id')
+          if (!id || !REQUEST_FILE.test(id)) return new Response(null, { status: 400 })
+          await rm(join(DESKTOP_REQUESTS, id), { force: true })
+          return new Response(null, { status: 204 })
+        }
+
+        const ids = await readdir(DESKTOP_REQUESTS).catch(error => {
+          if (error.code === 'ENOENT') return []
+          throw error
+        })
+        for (const id of ids.filter(id => REQUEST_FILE.test(id)).sort()) {
+          const file = join(DESKTOP_REQUESTS, id)
+          try {
+            const info = await stat(file)
+            if (Date.now() - info.mtimeMs > REQUEST_LIFETIME_MS) {
+              await rm(file, { force: true })
+              continue
+            }
+            const path = await readFile(file, 'utf8')
+            if (isAbsolute(path)) return Response.json({ id, path }, { headers: { 'cache-control': 'no-store' } })
+            await rm(file, { force: true })
+          } catch (error) {
+            if (error.code !== 'ENOENT') throw error
+          }
+        }
+        return new Response(null, { status: 204, headers: { 'cache-control': 'no-store' } })
+      },
     })
   })
 }
@@ -80,6 +86,7 @@ function sweepTempFolders(ctx) {
 }
 
 export function apply(ctx) {
-  publishSignInUrl(ctx)
+  if (ctx.get('profileContext')?.name !== 'desktop') return
+  serveDesktopRequests(ctx)
   sweepTempFolders(ctx)
 }
